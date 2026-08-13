@@ -84,6 +84,79 @@ function isHtmlBody(body: string): boolean {
   return /^\s*(<!doctype\s+html|<html)/i.test(body);
 }
 
+export class GoogleApiError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = 'GoogleApiError';
+    this.status = status;
+  }
+}
+
+const MIME_PRESENTATION = 'application/vnd.google-apps.presentation';
+const MIME_SPREADSHEET = 'application/vnd.google-apps.spreadsheet';
+
+const MIME_LABELS: Record<string, string> = {
+  [MIME_PRESENTATION]: 'a Google Slides presentation',
+  [MIME_SPREADSHEET]: 'a Google Sheet',
+  'application/vnd.google-apps.document': 'a Google Doc',
+  'application/vnd.google-apps.folder': 'a Drive folder',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation':
+    'an uploaded PowerPoint (.pptx) that has not been converted to Google Slides',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet':
+    'an uploaded Excel workbook (.xlsx) that has not been converted to Google Sheets',
+  'application/pdf': 'a PDF',
+};
+
+function describeMime(mimeType: string): string {
+  return MIME_LABELS[mimeType] || `a file of type "${mimeType}"`;
+}
+
+/**
+ * Check a file's identity via the Drive API before handing the ID to the
+ * Slides/Sheets API.
+ *
+ * Slides and Sheets answer an unknown or wrong-type file ID with a 400 and an
+ * HTML "unable to open the file" page rather than a JSON error, which tells the
+ * user nothing. Drive always answers with JSON, so this turns that dead end into
+ * a specific message. Best-effort: anything inconclusive falls through to the
+ * real call rather than blocking it.
+ */
+async function assertDriveFileType(
+  fileId: string,
+  token: string,
+  expectedMime: string
+): Promise<void> {
+  let meta: any;
+  try {
+    const url =
+      `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}` +
+      `?fields=id,name,mimeType&supportsAllDrives=true`;
+    meta = await fetchGoogleApi(url, token);
+  } catch (err: any) {
+    if (err instanceof GoogleApiError && (err.status === 404 || err.status === 403)) {
+      throw new Error(
+        `Google could not open the file with ID "${fileId}" (HTTP ${err.status}). ` +
+          'Either no such file exists, or the Google account you are signed in with does not have ' +
+          'access to it. Open the file in Drive while signed in as that account to check, then copy ' +
+          'the link again from Share → Copy link.'
+      );
+    }
+    // Anything else (network blip, missing Drive scope) is inconclusive.
+    return;
+  }
+
+  if (meta?.mimeType && meta.mimeType !== expectedMime) {
+    const name = meta.name ? `"${meta.name}"` : `ID "${fileId}"`;
+    throw new Error(
+      `${name} is ${describeMime(meta.mimeType)}, not ${describeMime(expectedMime)}. ` +
+        (meta.mimeType.startsWith('application/vnd.openxmlformats')
+          ? 'Open it in Drive and use File → Save as Google Slides/Sheets, then use the link to the converted copy.'
+          : 'Pick the right file and copy its link again.')
+    );
+  }
+}
+
 /**
  * Helper to fetch Google REST API with Bearer token
  */
@@ -125,10 +198,10 @@ async function fetchGoogleApi(url: string, token: string, options: RequestInit =
       // Slides/Docs answer an unknown or wrong-type file ID with an HTML
       // "unable to open the file" page rather than a JSON API error.
       detail =
-        'Google returned an error page instead of an API response. That usually means the file ID is wrong, ' +
-        'the file has been deleted, or it is not the type this step expects (for example a .pptx/.xlsx upload ' +
-        'that has not been converted to Google Slides/Sheets). Check the link, and that the Google account you ' +
-        'are signed in with can open it.';
+        `Google returned an error page instead of an API response for ${url}. That usually means the file ID ` +
+        'is wrong, the file has been deleted, or it is not the type this step expects (for example a .pptx/.xlsx ' +
+        'upload that has not been converted to Google Slides/Sheets). Check the link, and that the Google account ' +
+        'you are signed in with can open it.';
     } else {
       detail = raw.trim().slice(0, 300);
     }
@@ -137,7 +210,7 @@ async function fetchGoogleApi(url: string, token: string, options: RequestInit =
     const message = detail && detail !== '{}'
       ? `Google API error (${response.status}): ${detail}`
       : `Google API error (${response.status}: ${statusText})`;
-    throw new Error(message);
+    throw new GoogleApiError(message, response.status);
   }
 
   return response.json();
@@ -152,6 +225,8 @@ export async function fetchSheetData(
   sheetName?: string,
   rowIndex = 0
 ): Promise<ParsedSheetData> {
+  await assertDriveFileType(spreadsheetId, token, MIME_SPREADSHEET);
+
   // 1. Get spreadsheet metadata
   const metaUrl = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}?fields=properties.title,sheets.properties`;
   const meta = await fetchGoogleApi(metaUrl, token);
@@ -238,6 +313,8 @@ export async function fetchSlideTemplate(
   presentationId: string,
   token: string
 ): Promise<SlideTemplateData> {
+  await assertDriveFileType(presentationId, token, MIME_PRESENTATION);
+
   const url = `https://slides.googleapis.com/v4/presentations/${presentationId}`;
   const presentation = await fetchGoogleApi(url, token);
 
