@@ -1,0 +1,1 @@
+{"name":"Board Presentation Generator","description":"Generates Google Slides presentations from Google Sheets data using slide templates.","requestFramePermissions":[],"majorCapabilities":["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]}
