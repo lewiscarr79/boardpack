@@ -6,25 +6,82 @@ import {
   GoogleFileItem,
 } from '../types';
 
+export interface GoogleFileRef {
+  id: string | null;
+  error: string | null;
+}
+
+// Drive file IDs are long opaque strings. The floor rules out fragments such as
+// the literal "e" in a /d/e/ publish link while staying below the shortest real ID.
+const DRIVE_ID_PATTERN = /^[a-zA-Z0-9_-]{15,}$/;
+
+const SHARE_LINK_HINT =
+  'Open the file in Google Drive and use Share → Copy link — it looks like https://docs.google.com/presentation/d/FILE_ID/edit';
+
+/**
+ * Resolve a pasted Google link (or bare file ID) to a Drive file ID.
+ *
+ * Returns an explanatory `error` instead of a half-parsed ID when the link
+ * cannot yield one, so the caller never sends a bogus ID to Google.
+ */
+export function parseGoogleFileRef(input: string): GoogleFileRef {
+  const trimmed = (input || '').trim().replace(/^[<"'\s]+|[>"'\s]+$/g, '');
+
+  if (!trimmed) {
+    return { id: null, error: 'Paste a Google Drive link or file ID first.' };
+  }
+
+  // Bare file ID (no URL punctuation can survive DRIVE_ID_PATTERN)
+  if (DRIVE_ID_PATTERN.test(trimmed)) {
+    return { id: trimmed, error: null };
+  }
+
+  // "Publish to the web" links (/d/e/2PACX-.../pub) carry a publish token, not a
+  // file ID. The old /\/d\/(...)/ match returned "e" here, and Google answered
+  // that with a 400 HTML "unable to open the file" page.
+  if (/\/d\/e\//.test(trimmed)) {
+    return {
+      id: null,
+      error: `That is a "Publish to the web" link, which does not contain the file ID. ${SHARE_LINK_HINT}`,
+    };
+  }
+
+  if (/\/drive\/(?:u\/\d+\/)?folders\//.test(trimmed)) {
+    return {
+      id: null,
+      error: `That link points to a Drive folder, not a file. ${SHARE_LINK_HINT}`,
+    };
+  }
+
+  // .../d/FILE_ID/... (also matches /presentation/u/0/d/FILE_ID/edit)
+  const fromPath = trimmed.match(/\/d\/([a-zA-Z0-9_-]+)/);
+  // .../open?id=FILE_ID, .../uc?id=FILE_ID&export=download
+  const fromQuery = trimmed.match(/[?&#]id=([a-zA-Z0-9_-]+)/);
+  const candidate = (fromPath && fromPath[1]) || (fromQuery && fromQuery[1]) || null;
+
+  if (!candidate) {
+    return { id: null, error: `Could not find a Google file ID in that link. ${SHARE_LINK_HINT}` };
+  }
+
+  if (!DRIVE_ID_PATTERN.test(candidate)) {
+    return {
+      id: null,
+      error: `"${candidate}" is not a valid Google file ID. ${SHARE_LINK_HINT}`,
+    };
+  }
+
+  return { id: candidate, error: null };
+}
+
 /**
  * Extract Google File ID from full URL or return ID if raw string
  */
 export function extractFileId(input: string): string | null {
-  if (!input) return null;
-  const trimmed = input.trim();
-  
-  // Google Sheets / Slides / Drive URL pattern
-  const urlMatch = trimmed.match(/\/d\/([a-zA-Z0-9-_]+)/);
-  if (urlMatch && urlMatch[1]) {
-    return urlMatch[1];
-  }
+  return parseGoogleFileRef(input).id;
+}
 
-  // If it looks like a direct ID (e.g. 25+ alphanumeric/hyphen chars)
-  if (/^[a-zA-Z0-9-_]{20,}$/.test(trimmed)) {
-    return trimmed;
-  }
-
-  return null;
+function isHtmlBody(body: string): boolean {
+  return /^\s*(<!doctype\s+html|<html)/i.test(body);
 }
 
 /**
@@ -46,17 +103,34 @@ async function fetchGoogleApi(url: string, token: string, options: RequestInit =
   });
 
   if (!response.ok) {
+    // Read the body once. Calling response.json() first and falling back to
+    // response.text() throws "body already read" and loses the error entirely.
+    const raw = await response.text().catch(() => '');
+    console.error('Google API Error Response:', response.status, response.statusText, url, raw);
+
     let detail = '';
+    let errorData: any = null;
     try {
-      const errorData = await response.json();
-      console.error('Google API Error Response:', response.status, response.statusText, errorData);
-      detail = errorData.error?.message 
-        || (Array.isArray(errorData.error?.errors) && errorData.error.errors[0]?.message)
-        || errorData.message 
-        || (typeof errorData.error === 'string' ? errorData.error : '');
+      errorData = raw ? JSON.parse(raw) : null;
     } catch {
-      const text = await response.text().catch(() => '');
-      detail = text;
+      errorData = null;
+    }
+
+    if (errorData) {
+      detail = errorData.error?.message
+        || (Array.isArray(errorData.error?.errors) && errorData.error.errors[0]?.message)
+        || errorData.message
+        || (typeof errorData.error === 'string' ? errorData.error : '');
+    } else if (isHtmlBody(raw)) {
+      // Slides/Docs answer an unknown or wrong-type file ID with an HTML
+      // "unable to open the file" page rather than a JSON API error.
+      detail =
+        'Google returned an error page instead of an API response. That usually means the file ID is wrong, ' +
+        'the file has been deleted, or it is not the type this step expects (for example a .pptx/.xlsx upload ' +
+        'that has not been converted to Google Slides/Sheets). Check the link, and that the Google account you ' +
+        'are signed in with can open it.';
+    } else {
+      detail = raw.trim().slice(0, 300);
     }
 
     const statusText = response.statusText || 'Bad Request';

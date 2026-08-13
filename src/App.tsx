@@ -9,7 +9,7 @@ import { ResultBanner } from './components/ResultBanner';
 import { HistoryDrawer } from './components/HistoryDrawer';
 import { openGoogleDrivePicker } from './services/googlePicker';
 import {
-  extractFileId,
+  parseGoogleFileRef,
   fetchSlideTemplate,
   fetchSheetData,
   buildPlaceholderMappings,
@@ -89,9 +89,9 @@ export default function App() {
         return;
       }
 
-      const fileId = extractFileId(urlOrId);
+      const { id: fileId, error: refError } = parseGoogleFileRef(urlOrId);
       if (!fileId) {
-        setTemplateError('Invalid Google Slides link or ID. Please check the URL.');
+        setTemplateError(refError || 'Invalid Google Slides link or ID. Please check the URL.');
         return;
       }
 
@@ -119,9 +119,9 @@ export default function App() {
         return;
       }
 
-      const fileId = extractFileId(urlOrId);
+      const { id: fileId, error: refError } = parseGoogleFileRef(urlOrId);
       if (!fileId) {
-        setSheetError('Invalid Google Sheet link or ID. Please check the URL.');
+        setSheetError(refError || 'Invalid Google Sheet link or ID. Please check the URL.');
         return;
       }
 
