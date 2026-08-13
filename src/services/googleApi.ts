@@ -216,6 +216,53 @@ async function fetchGoogleApi(url: string, token: string, options: RequestInit =
   return response.json();
 }
 
+const SCOPE_PRESENTATIONS = 'https://www.googleapis.com/auth/presentations';
+
+/**
+ * Ask Google which scopes the current access token actually carries.
+ * Returns null if the check itself fails, so it can never mask the real error.
+ */
+async function fetchGrantedScopes(token: string): Promise<string[] | null> {
+  try {
+    const res = await fetch(
+      `https://www.googleapis.com/oauth2/v3/tokeninfo?access_token=${encodeURIComponent(token)}`
+    );
+    if (!res.ok) return null;
+    const info = await res.json();
+    return typeof info?.scope === 'string' ? info.scope.split(/\s+/).filter(Boolean) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Turn a failed Slides/Sheets call into a scope problem when that is what it is.
+ *
+ * A user can untick individual permissions on the Google consent screen, which
+ * leaves a token that works for one API and not another. Google does not always
+ * report that as a clean 403, so confirm it against tokeninfo.
+ */
+async function explainWithScopeCheck(
+  err: unknown,
+  token: string,
+  scope: string,
+  apiLabel: string
+): Promise<Error> {
+  const base = err instanceof Error ? err : new Error(String(err));
+  const granted = await fetchGrantedScopes(token);
+
+  if (granted && !granted.includes(scope)) {
+    return new Error(
+      `Your Google sign-in does not include permission to use ${apiLabel}. The "${scope}" ` +
+        'permission is missing from the token, which is why Sheets works but Slides does not. ' +
+        'Disconnect, connect again, and leave every checkbox ticked on the Google consent screen. ' +
+        `(Permissions currently granted: ${granted.join(', ') || 'none'}.)`
+    );
+  }
+
+  return base;
+}
+
 /**
  * Fetch Google Sheet metadata and values
  */
@@ -316,7 +363,12 @@ export async function fetchSlideTemplate(
   await assertDriveFileType(presentationId, token, MIME_PRESENTATION);
 
   const url = `https://slides.googleapis.com/v4/presentations/${presentationId}`;
-  const presentation = await fetchGoogleApi(url, token);
+  let presentation: any;
+  try {
+    presentation = await fetchGoogleApi(url, token);
+  } catch (err) {
+    throw await explainWithScopeCheck(err, token, SCOPE_PRESENTATIONS, 'Google Slides');
+  }
 
   const title = presentation.title || 'Untitled Presentation';
   const slides = presentation.slides || [];
@@ -549,10 +601,15 @@ export async function createSampleBoardSlideTemplateInDrive(token: string): Prom
     title: 'Sample Board Meeting Deck Template (Master)',
   };
 
-  const created = await fetchGoogleApi(url, token, {
-    method: 'POST',
-    body: JSON.stringify(body),
-  });
+  let created: any;
+  try {
+    created = await fetchGoogleApi(url, token, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+  } catch (err) {
+    throw await explainWithScopeCheck(err, token, SCOPE_PRESENTATIONS, 'Google Slides');
+  }
 
   const presentationId = created.presentationId;
 
