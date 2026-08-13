@@ -122,17 +122,43 @@ function describeMime(mimeType: string): string {
  * a specific message. Best-effort: anything inconclusive falls through to the
  * real call rather than blocking it.
  */
-async function assertDriveFileType(
+const MIME_SHORTCUT = 'application/vnd.google-apps.shortcut';
+
+const DRIVE_FIELDS = 'id,name,mimeType,trashed,shortcutDetails,driveId,ownedByMe';
+
+async function getDriveMeta(fileId: string, token: string): Promise<any> {
+  const url =
+    `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}` +
+    `?fields=${encodeURIComponent(DRIVE_FIELDS)}&supportsAllDrives=true`;
+  return fetchGoogleApi(url, token);
+}
+
+export interface ResolvedDriveFile {
+  /** The ID to actually call Slides/Sheets with (follows shortcuts). */
+  id: string;
+  /** Human-readable account of what Drive said, for use in error messages. */
+  note: string;
+}
+
+/**
+ * Resolve and vet a file ID via the Drive API before handing it to
+ * Slides/Sheets.
+ *
+ * Slides and Sheets answer an unknown, trashed or wrong-type file ID with a 400
+ * and an HTML "unable to open the file" page rather than a JSON error, which
+ * tells the user nothing. Drive always answers with JSON, so ask it first.
+ *
+ * Never silent: whatever happens, the returned `note` records what Drive said so
+ * a later failure can report it instead of leaving the cause a mystery.
+ */
+async function resolveDriveFile(
   fileId: string,
   token: string,
   expectedMime: string
-): Promise<void> {
+): Promise<ResolvedDriveFile> {
   let meta: any;
   try {
-    const url =
-      `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}` +
-      `?fields=id,name,mimeType&supportsAllDrives=true`;
-    meta = await fetchGoogleApi(url, token);
+    meta = await getDriveMeta(fileId, token);
   } catch (err: any) {
     if (err instanceof GoogleApiError && (err.status === 404 || err.status === 403)) {
       throw new Error(
@@ -142,8 +168,28 @@ async function assertDriveFileType(
           'the link again from Share → Copy link.'
       );
     }
-    // Anything else (network blip, missing Drive scope) is inconclusive.
-    return;
+    const why = err instanceof Error ? err.message : String(err);
+    return { id: fileId, note: `Drive lookup did not complete (${why}).` };
+  }
+
+  // A shortcut has its own file ID; Slides/Sheets cannot open it directly.
+  if (meta?.mimeType === MIME_SHORTCUT) {
+    const targetId = meta.shortcutDetails?.targetId;
+    if (!targetId) {
+      throw new Error(
+        `"${meta.name || fileId}" is a Drive shortcut with no resolvable target. ` +
+          'Open the real file and copy its link instead.'
+      );
+    }
+    const inner = await resolveDriveFile(targetId, token, expectedMime);
+    return { id: inner.id, note: `Followed Drive shortcut to ${targetId}. ${inner.note}` };
+  }
+
+  if (meta?.trashed) {
+    throw new Error(
+      `"${meta.name || fileId}" is in the Drive bin. Google refuses API access to trashed files. ` +
+        'Restore it in Drive, or use a link to a file that is not deleted.'
+    );
   }
 
   if (meta?.mimeType && meta.mimeType !== expectedMime) {
@@ -155,6 +201,14 @@ async function assertDriveFileType(
           : 'Pick the right file and copy its link again.')
     );
   }
+
+  const where = meta?.driveId ? 'a shared drive' : 'My Drive';
+  return {
+    id: fileId,
+    note:
+      `Drive reports: name "${meta?.name ?? 'unknown'}", type "${meta?.mimeType ?? 'unknown'}", ` +
+      `in ${where}, ownedByMe=${meta?.ownedByMe ?? 'unknown'}.`,
+  };
 }
 
 /**
@@ -246,7 +300,8 @@ async function explainWithScopeCheck(
   err: unknown,
   token: string,
   scope: string,
-  apiLabel: string
+  apiLabel: string,
+  driveNote = ''
 ): Promise<Error> {
   const base = err instanceof Error ? err : new Error(String(err));
   const granted = await fetchGrantedScopes(token);
@@ -260,7 +315,11 @@ async function explainWithScopeCheck(
     );
   }
 
-  return base;
+  const scopeNote = granted
+    ? `Slides permission is granted, so this is not a consent problem.`
+    : 'Could not verify which permissions the token carries.';
+
+  return new Error(`${base.message}\n\n${scopeNote}${driveNote ? ` ${driveNote}` : ''}`);
 }
 
 /**
@@ -272,7 +331,8 @@ export async function fetchSheetData(
   sheetName?: string,
   rowIndex = 0
 ): Promise<ParsedSheetData> {
-  await assertDriveFileType(spreadsheetId, token, MIME_SPREADSHEET);
+  const resolved = await resolveDriveFile(spreadsheetId, token, MIME_SPREADSHEET);
+  spreadsheetId = resolved.id;
 
   // 1. Get spreadsheet metadata
   const metaUrl = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}?fields=properties.title,sheets.properties`;
@@ -360,14 +420,14 @@ export async function fetchSlideTemplate(
   presentationId: string,
   token: string
 ): Promise<SlideTemplateData> {
-  await assertDriveFileType(presentationId, token, MIME_PRESENTATION);
+  const resolved = await resolveDriveFile(presentationId, token, MIME_PRESENTATION);
 
-  const url = `https://slides.googleapis.com/v4/presentations/${presentationId}`;
+  const url = `https://slides.googleapis.com/v4/presentations/${resolved.id}`;
   let presentation: any;
   try {
     presentation = await fetchGoogleApi(url, token);
   } catch (err) {
-    throw await explainWithScopeCheck(err, token, SCOPE_PRESENTATIONS, 'Google Slides');
+    throw await explainWithScopeCheck(err, token, SCOPE_PRESENTATIONS, 'Google Slides', resolved.note);
   }
 
   const title = presentation.title || 'Untitled Presentation';
